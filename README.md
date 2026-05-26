@@ -1,1038 +1,614 @@
-# Lab 11: Safe Deletion of Files and Directories — `rm`, `rmdir`, `rm -rf`
+# Lab: Safe Deletion of Files and Directories — `rm`, `rmdir`, `rm -rf`
 
-**Series:** File Operations & Shell Fundamentals · **Lab 11 of the Novice → RHCA path**  
-**Certifications covered:** RHCSA EX200 (Tasks 8, 11, 16, 18, 20), RHCE EX294 (Ansible `file: state=absent`), CKA (`kubectl delete`, manifest removal), RHCA building blocks (RH342, RH358)  
-**Prerequisite:** Labs 05–10  
-**Time Estimate:** 40–55 minutes  
-**Difficulty arc:** Tasks 1–6 foundation · 7–13 practical · 14–18 advanced · 19–20 exam-realistic
-
----
-
-## 🎯 Objective
-
-Delete files and directories **safely and intentionally**. Master `rm`, `rmdir`, and the infamous `rm -rf` — and learn the verification, dry-run, and safer-alternative habits that prevent the career-ending mistake of `rm -rf /` or `rm -rf $UNDEFINED/`.
+**Series:** linux-ops-mastery — RHCSA Essential Tools & File Operations
+**Subjects covered:** `rm` for files, `rmdir` for empty directories, `rm -rf` for recursive trees, the no-undo nature of `rm`, `--preserve-root` protection, `--one-file-system` boundary, `-i` and `-I` interactive prompts, `-v` verbose, the quarantine-first habit (`mv → /tmp/trash`), `find -delete` for criteria-based cleanup, the catastrophic `rm -rf $UNSET/` family of incidents, why `rm` does not free data immediately if a process holds it open, and the senior-engineer protective routine `pwd; ls; quote variables; absolute paths`
+**Career arcs covered:** RHCSA ("remove the file" exam tasks and cleanup of test fixtures), RHCE (Ansible `file: state=absent`), SRE (incident cleanup of stale lockfiles, log rotation), DevOps (CI cache invalidation), AI/MLOps (cleaning up old checkpoints / scratch space)
+**Prerequisite:** Labs 05–10 (navigation, listing, copy, links, move)
+**Time Estimate:** 30 to 45 minutes
+**Difficulty arc:** Task 1 foundation (`rm FILE`) · 2 `rmdir` vs `rm -r` · 3 `rm -rf` carefully · 4 `-i`/`-I` safety prompts · 5 quarantine + `find -delete` patterns · 6 RHCSA exam-realistic capstone
 
 ---
 
-## 🧠 Concept: There Is No Undelete
+## Objective
 
-Linux has **no recycle bin** at the command line. When `rm` returns success, the directory entry is gone, and (after the last hard link is removed and no process holds the file open) the inode and data blocks are released. Forensic recovery is sometimes possible, often not. **There is no Ctrl-Z.**
+Delete files and directories **deliberately and safely**. By the end of this lab you can run `rm -rf` on a directory tree without flinching — because the discipline of `pwd; ls; quote vars; absolute paths` has become a reflex, and you know exactly which rm options exist to catch the mistakes everybody makes.
+
+The capstone is an exam-realistic prompt: *"Clean out `/root/cleanup/` of every file older than 30 days and every empty subdirectory, but leave files newer than 30 days intact. Confirm the count of survivors and report the count of removed items."*
+
+> **Lab safety note:** Every command in this lab targets `/tmp/rm-lab` and `/root/cleanup`. No system files are touched. The infamous `rm -rf /` and `rm -rf "$DIR"/` failure modes are demonstrated **only** in scenarios that cannot reach real paths.
+
+---
+
+## Concept: `rm` Is the Shredder, Not the Recycle Bin
+
+`rm` removes the **directory entry** that names a file. If the entry was the last name pointing at that inode (and no process has the file open), the kernel frees the inode and its data blocks. There is **no recycle bin** at the command line on Linux.
 
 ```
-rm file.txt
-   │
-   └── directory entry "file.txt" removed
-        └── if link count hits 0 AND no FD open → inode + blocks freed → data gone
+   ┌────────────────────────────────────────────────────────────────┐
+   │   rm file.txt                                                  │
+   ├────────────────────────────────────────────────────────────────┤
+   │   1.  unlink("file.txt")            ← remove directory entry   │
+   │   2.  If inode link count == 0:                                │
+   │         If no process holds the file open:                     │
+   │           Free inode + data blocks immediately.                │
+   │         Else:                                                  │
+   │           Defer free until last FD is closed.                  │
+   │       Else:                                                    │
+   │         Other names still point at the inode — data lives on.  │
+   └────────────────────────────────────────────────────────────────┘
 ```
 
-> The single biggest cause of catastrophic data loss in Linux history: a `rm -rf` command where a variable expanded to empty or to `/`.
-
-### Command mental model
-
-| Command | Removes files? | Removes directories? | Recursive? | Prompts? |
-|---|---|---|---|---|
-| `rm` | ✅ | ❌ (unless `-d` + empty) | ❌ | Sometimes (alias) |
-| `rm -d` | ✅ | ✅ (only empty) | ❌ | Sometimes |
-| `rm -r` | ✅ | ✅ (any state) | ✅ | Sometimes |
-| `rm -i` | ✅ | with `-r` | with `-r` | **Always** |
-| `rm -I` | ✅ | with `-r` | with `-r` | **Once** for >3 files or recursive |
-| `rm -rf` | ✅ | ✅ (any) | ✅ | **Never** |
-| `rmdir` | ❌ | ✅ (only empty) | ❌ (unless `-p`) | Never |
+> **Why this matters:** The single biggest cause of catastrophic data loss in Linux history is a `rm -rf` command where a variable expanded to empty or to `/`. The kernel will do exactly what you typed — no second chances.
 
 ---
 
-## 📚 `rm` and `rmdir` Reference
+## 📜 Why `rm` Is Dangerous by Design — The Story
 
-### `rm`
+When Unix shipped in **1971** on a PDP-7 with kilobytes of memory, disks measured in megabytes, and no notion of "trash folders," there was simply no room to keep a hidden duplicate of every deleted file. So `rm` ships with **immediate, irreversible** deletion and zero prompting unless you ask for it.
+
+The decision stuck for 55 years. Modern Linux still ships `rm` as a fast, scriptable, no-frills deletion tool — because **scripts** need exactly this behavior: run, free space, exit zero. Safety features were grafted on one at a time over the decades:
+
+- **`-i`** (1980s) — prompt before every deletion. Annoying enough that nobody uses it interactively.
+- **`-I`** (GNU coreutils) — prompt **once** for the whole operation when removing >3 files or recursing.
+- **`--preserve-root`** (added 2004 after too many accidents) — refuse to remove `/`. Default since coreutils 6.x.
+- **`--one-file-system`** — refuse to cross mount points during recursive delete.
+- **`shred -u`** — overwrite-then-delete for sensitive data on spinning disks.
+
+These exist because the consequences of "no undo" became more painful at scale. Today's senior engineers don't avoid `rm` — they build **habits** around it.
+
+> **The point of the story:** `rm` is a knife. The reason it has no safety lock is that scripts need it sharp. The reason senior engineers never cut themselves with it is that they always look at the blade before they swing.
+
+---
+
+## 👪 The Deletion Family — Who Lives There
+
+| Task | Command | Notes |
+|---|---|---|
+| Remove a single file | `rm FILE` | Irreversible, no prompt by default |
+| Remove an empty directory | `rmdir DIR` | Refuses non-empty dirs |
+| Remove empty dirs up the chain | `rmdir -p A/B/C` | Removes A/B/C, then A/B, then A if empty |
+| Recursive remove | `rm -r DIR` | Removes everything below DIR + DIR itself |
+| Recursive + ignore missing + no prompts | `rm -rf DIR` | The "just do it" form |
+| Prompt before every deletion | `rm -ri DIR` | Per-file Y/N |
+| Prompt once for whole operation | `rm -Ir DIR` | Most useful interactive safety |
+| Verbose | `rm -rv DIR` | Audit trail of removals |
+| Stop at filesystem boundaries | `rm -rf --one-file-system DIR` | Refuses to cross mounts |
+| Default `/` protection | (built-in `--preserve-root`) | Cannot remove `/` even with `-rf` |
+| Remove a file whose name starts with `-` | `rm -- -file` or `rm ./-file` | The `--` ends option processing |
+| Delete by criteria | `find PATH -PRED -delete` | Used for "older than N days" cleanups |
+| Quarantine instead | `mv FILE /tmp/trash/` | Undo-friendly |
+| Sensitive data on a spinning disk | `shred -u FILE` | Overwrite + unlink (less effective on SSD) |
+| Empty a file held open by a daemon | `: > FILE` or `truncate -s 0 FILE` | Do not unlink — daemon's FD becomes useless |
+
+### `rm` flag reference
 
 | Flag | Long form | Purpose |
 |---|---|---|
-| `-r` / `-R` | `--recursive` | Delete directories and their contents |
+| `-r` / `-R` | `--recursive` | Recurse into directories |
 | `-f` | `--force` | Ignore nonexistent files; do not prompt |
-| `-i` | `--interactive=always` | Prompt before **every** deletion |
-| `-I` | `--interactive=once` | Prompt once if >3 files or recursive |
-| `-d` | `--dir` | Allow removing **empty** directories without `-r` |
-| `-v` | `--verbose` | Print each file removed |
-| `--one-file-system` | — | When recursing, don't cross filesystem boundaries |
-| `--preserve-root` | — | (Default on GNU rm) refuse to operate recursively on `/` |
-| `--no-preserve-root` | — | **DANGER** — disables the `/` safeguard |
+| `-i` | `--interactive=always` | Prompt before every deletion |
+| `-I` | `--interactive=once` | Prompt once for the whole operation |
+| `-v` | `--verbose` | Print each removal |
+| `-d` | `--dir` | Remove an empty directory (like `rmdir`) |
+| `--preserve-root` | (default) | Refuse to remove `/` |
+| `--no-preserve-root` | (override) | Allow `/` (please never) |
+| `--one-file-system` | — | Refuse to cross mount points |
 
-### `rmdir`
+> **The point of the family tree:** Pick the smallest blast radius for the job. `rmdir` for one empty directory. `rm` for one file. `rm -rf` only for trees you absolutely know. `find -delete` for criteria-based cleanup.
 
-| Flag | Long form | Purpose |
+---
+
+## 🔬 The Anatomy of `rm -rf` — In One Diagram
+
+```
+$ rm -rf /tmp/build-cache
+
+What actually happens:
+  1.  fts_open(/tmp/build-cache)
+  2.  For each entry encountered (depth-first):
+        - regular file       → unlink(2)
+        - empty directory    → rmdir(2)
+        - non-empty directory → recurse first, then rmdir(2)
+        - symlink            → unlink(2)  (target untouched)
+  3.  Finally rmdir the top.
+
+`-f` modifies behavior at every step:
+   - missing target          → silent (exit 0)
+   - permission error        → silent (exit 0)   ← THE DANGER
+   - prompt-worthy condition → suppressed
+
+`--preserve-root` (default):
+   - If target literally resolves to `/`, refuse with an error.
+   - Does NOT protect against `rm -rf "$UNSET"/` expanding to `rm -rf /`
+     unless the `/` is literal at the time of parse.
+```
+
+> **Reading rule:** `rm -rf` plus an unquoted variable is the single most common production-incident command. Always quote `"$VAR"` and always check `pwd` and `ls` before you commit.
+
+---
+
+## 📚 Deletion Reference Table
+
+| Task | Command | Notes |
 |---|---|---|
-| (none) | — | Remove an empty directory |
-| `-p` | `--parents` | Remove the directory **and** any empty parents up the chain |
-| `-v` | `--verbose` | Print each directory removed |
-| `--ignore-fail-on-non-empty` | — | Don't fail on non-empty (just skip) |
+| Delete file | `rm FILE` | Use `rm -i` for safety |
+| Delete file with verbose audit | `rm -v FILE` | Prints `removed 'FILE'` |
+| Delete empty dir | `rmdir DIR` | Refuses non-empty |
+| Delete empty dir + empty parents | `rmdir -p A/B/C` | Whole empty chain |
+| Recursive delete of a tree | `rm -r DIR` | Removes everything under DIR + DIR |
+| Recursive + silent + force | `rm -rf DIR` | The "fully automatic" form |
+| Recursive + prompt-once | `rm -Ir DIR` | One prompt; safe default for interactive use |
+| Recursive + audit trail | `rm -rv DIR` | Verbose recursive delete |
+| Block crossing mount points | `rm -rf --one-file-system DIR` | Bind mounts and submounts stay safe |
+| File whose name starts with `-` | `rm -- -file` | `--` ends option parsing |
+| Wipe sensitive data on HDD | `shred -u FILE` | Overwrite + unlink (HDD-effective; SSD wear-leveled) |
+| Empty a held-open file in place | `: > FILE` | Truncate without unlinking (preserves daemon's FD) |
+| Delete by criteria | `find PATH -mtime +30 -delete` | Replaces `xargs rm` for many cases |
+| Quarantine instead of delete | `mv FILE /tmp/trash/` | Reversible until you `rm` `/tmp/trash` later |
+
+> **Rule one of deletion:** Always `pwd; ls` before `rm -rf`. Always quote `"$VAR"`. Always prefer absolute paths in scripts.
 
 ---
 
-## 🛣️ RHCA Pathway Sidebar
+## 🎯 Career Pathway Sidebar
 
-| Cert level | Why this lab matters |
+| Level | Why this lab matters |
 |---|---|
-| **RHCSA EX200** | Tasks 8, 11, 16, 18, 20 require careful deletion |
-| **RHCE EX294** | `ansible.builtin.file: state=absent` mirrors `rm -rf`; idempotent |
-| **CKA** | `kubectl delete -f`; manual cleanup of `/etc/kubernetes/manifests/*.yaml.bak` |
-| **RHCA — RH342** | Quarantine before deletion; recovery via inode forensics |
-| **RHCA — RH358** | Service cleanup: stop, then `rm` of runtime state |
+| **RHCSA candidate** | "Remove the file `/tmp/old.log`" tasks; cleanup at end of every exam task. |
+| **RHCE candidate** | Ansible `file: state=absent` is idempotent `rm -rf`. |
+| **SRE / Platform** | Cleaning up stale lockfiles, rotated logs, expired sessions; `find -mtime +N -delete` is the universal cron cleanup. |
+| **DevOps** | CI cache eviction; `docker prune`-style cleanups. |
+| **AI / MLOps** | Removing old checkpoints to free GPU scratch; cleaning failed-run directories. |
 
 ---
 
-## 🔧 The 20 Tasks
+## 🔧 The 6 Tasks
+
+> Six exam-realistic phases that build the **pwd → ls → quote → delete → verify** habit.
 
 ---
 
-### Task 1 — Set up the lab workspace
+### Task 1 — Remove single files safely
 
-**Purpose:** Build a realistic mix of empty and populated directories.
+**Purpose:** Build the sandbox, create test files, and remove them one at a time using `rm`, `rm -v`, and `rm -i`.
 
 ```bash
-mkdir -p ~/rm-lab/{logs,configs,empty,empty/inner,tree/a/b/c}
-cd ~/rm-lab
-touch logs/app_{1..3}.log configs/{httpd,nginx,sshd}.conf tree/a/b/c/deep.txt
-ls -lR
-```
-
-**Expected output (excerpt):**
-
-```
-.:
-total 0
-drwxr-xr-x. 2 ec2-user ec2-user 30 Sep 12 15:00 configs
-drwxr-xr-x. 3 ec2-user ec2-user 18 Sep 12 15:00 empty
-drwxr-xr-x. 2 ec2-user ec2-user 53 Sep 12 15:00 logs
-drwxr-xr-x. 3 ec2-user ec2-user 13 Sep 12 15:00 tree
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `mkdir -p` | Create with missing parents |
-| `{logs,configs,empty,...}` | Brace expansion → multiple dirs in one call |
-| `app_{1..3}.log` | Three log files |
-
-**Output decoded**
-
-| Entry | Meaning |
-|---|---|
-| Four top-level dirs | Workspace ready |
-| Each is populated except `empty/` and its child | We'll test both states |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `mkdir: cannot create` | Path inside your home |
-
----
-
-### Task 2 — Remove a single file with `rm`
-
-**Purpose:** Most basic case — plain `rm` on one file.
-
-```bash
-ls logs/
-rm logs/app_1.log
-ls logs/
-```
-
-**Expected output:**
-
-```
-app_1.log  app_2.log  app_3.log
-app_2.log  app_3.log
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `rm FILE` | Remove one (or more) regular files |
-
-**Output decoded**
-
-| Phase | What happened |
-|---|---|
-| Before | 3 logs |
-| After | 2 logs — `app_1.log` removed |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `rm: cannot remove ... : Operation not permitted` | Immutable flag set — `sudo chattr -i FILE` first |
-
----
-
-### Task 3 — `rm` refuses directories without `-r`
-
-**Purpose:** First safety guardrail: `rm` won't delete directories unless you opt in.
-
-```bash
-rm logs/ 2>&1
-```
-
-**Expected output:**
-
-```
-rm: cannot remove 'logs/': Is a directory
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `rm DIR` | Refused unless `-d` (empty) or `-r` (recursive) is set |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `Is a directory` | `rm` is telling you it won't proceed |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Wanted to remove an empty dir | Use `rmdir` or `rm -d` |
-| Wanted to remove a populated dir | Use `rm -r` |
-
----
-
-### Task 4 — Remove an empty directory with `rmdir`
-
-**Purpose:** Safest directory removal — refuses if not empty.
-
-```bash
-rmdir empty/inner
-ls empty/
-```
-
-**Expected output:**
-
-```
-(empty parent directory listing)
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `rmdir DIR` | Remove empty directory; refuse non-empty |
-
-**Output decoded**
-
-| Phase | Effect |
-|---|---|
-| Before | `empty/inner` existed |
-| After | Gone; parent `empty/` is now empty |
-
-**Why a sysadmin needs this:** `rmdir` forces you to confirm there's no data inside — it refuses otherwise.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `rmdir: failed: Directory not empty` | Use `rm -r` (with care) or empty it first |
-
----
-
-### Task 5 — Remove an empty parent chain with `rmdir -p`
-
-**Purpose:** Symmetric cleanup after `mkdir -p`.
-
-```bash
-mkdir -p ~/rm-lab/empty/a/b/c
-rmdir -p ~/rm-lab/empty/a/b/c
-ls ~/rm-lab
-```
-
-**Expected output:**
-
-```
-configs  empty  logs  tree
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-p` | Remove the directory **and** any empty parents up the chain |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `empty/` survives | `rmdir -p` stops at the first non-empty parent (or at the start of an absolute path) |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `rmdir -p` failed midway | Hit a non-empty parent — that's by design |
-
----
-
-### Task 6 — Remove an empty directory with `rm -d`
-
-**Purpose:** A one-shot way to delete an empty dir without switching to `rmdir`.
-
-```bash
-mkdir ~/rm-lab/just_empty
-rm -d ~/rm-lab/just_empty
-ls ~/rm-lab
-```
-
-**Expected output:**
-
-```
-configs  empty  logs  tree
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-d` | Allow `rm` to remove an empty directory (no `-r`, no recursion) |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| Directory gone | Worked like `rmdir` |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `Directory not empty` | `-d` refuses non-empty — use `-r` if you really mean it |
-
----
-
-### Task 7 — Recursive removal with `-r`
-
-**Purpose:** Descend into a directory tree and remove everything.
-
-```bash
-ls -R tree/
-rm -r tree/
-ls ~/rm-lab
-```
-
-**Expected output:**
-
-```
-tree/:
-a
-
-tree/a:
-b
-
-tree/a/b:
-c
-
-tree/a/b/c:
-deep.txt
-
-configs  empty  logs
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-r` / `-R` | Recursive |
-
-**Output decoded**
-
-| Phase | What happened |
-|---|---|
-| Before | `tree/a/b/c/deep.txt` existed |
-| After | Entire `tree/` chain is gone |
-
-> ⚠️ **No prompt by default** on a fresh user. Many systems set `alias rm='rm -i'`. Type `\rm` to bypass the alias.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Asked for confirmation per file | An `-i` alias is active — type `\rm -r` or use `-I` |
-
----
-
-### Task 8 — Prompt-per-file with `-i`
-
-**Purpose:** Maximum safety — every deletion confirmed.
-
-```bash
-mkdir -p ~/rm-lab/promptdir
-touch ~/rm-lab/promptdir/{a,b,c}.txt
-rm -ri ~/rm-lab/promptdir
-```
-
-**Expected interaction:**
-
-```
-rm: descend into directory '/home/ec2-user/rm-lab/promptdir'? y
-rm: remove regular empty file '/home/ec2-user/rm-lab/promptdir/a.txt'? y
-rm: remove regular empty file '/home/ec2-user/rm-lab/promptdir/b.txt'? y
-rm: remove regular empty file '/home/ec2-user/rm-lab/promptdir/c.txt'? y
-rm: remove directory '/home/ec2-user/rm-lab/promptdir'? y
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-r` | Recursive |
-| `-i` | Prompt for **every** deletion |
-
-**Output decoded**
-
-| Prompt | Action |
-|---|---|
-| Each `?` | Type `y` (yes) or `n` (no) |
-
-**Why a sysadmin needs this:** When unsure of the contents, `-i` makes you read every line.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Too many prompts | Use `-I` (Task 9) for a single prompt |
-
----
-
-### Task 9 — Single prompt with `-I`
-
-**Purpose:** Middle ground — one prompt for the entire operation when >3 files or recursive.
-
-```bash
-mkdir -p ~/rm-lab/manyfiles
-touch ~/rm-lab/manyfiles/file_{01..10}.tmp
-rm -Ir ~/rm-lab/manyfiles
-```
-
-**Expected interaction:**
-
-```
-rm: remove 1 argument recursively? y
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-I` | Prompt **once** before recursive deletion or removing >3 files |
-
-**Output decoded**
-
-| Prompt | Meaning |
-|---|---|
-| `remove 1 argument recursively?` | One yes/no covers the whole tree |
-
-**Why a sysadmin needs this:** Many `~/.bashrc` set `alias rm='rm -I'` as a sane default.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Not getting the single prompt | `-I` only triggers for >3 files or recursive — for one file, it's silent |
-
----
-
-### Task 10 — Verbose deletion with `-v`
-
-**Purpose:** See what `rm` actually removed — your audit log.
-
-```bash
-mkdir -p ~/rm-lab/loud
-touch ~/rm-lab/loud/file_{01..05}.tmp
-rm -rv ~/rm-lab/loud
-```
-
-**Expected output:**
-
-```
-removed '/home/ec2-user/rm-lab/loud/file_01.tmp'
-removed '/home/ec2-user/rm-lab/loud/file_02.tmp'
-removed '/home/ec2-user/rm-lab/loud/file_03.tmp'
-removed '/home/ec2-user/rm-lab/loud/file_04.tmp'
-removed '/home/ec2-user/rm-lab/loud/file_05.tmp'
-removed directory '/home/ec2-user/rm-lab/loud'
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-r` | Recursive |
-| `-v` | Verbose — print each removal |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `removed '...'` | One file removed |
-| `removed directory '...'` | A directory removed after its children |
-
-**Why a sysadmin needs this:** Always pair `-r` with `-v` when destroying anything important.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Output overwhelming | Pipe to a log: `rm -rv DIR > /tmp/deleted.log 2>&1` |
-
----
-
-### Task 11 — Idempotent force with `-f`
-
-**Purpose:** Don't fail when files are missing; never prompt.
-
-```bash
-rm -f ~/rm-lab/this_does_not_exist.txt
-echo "exit code = $?"
-```
-
-**Expected output:**
-
-```
-exit code = 0
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-f` | Force — silently ignore nonexistent files, never prompt |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `exit code = 0` | Success even though the file didn't exist |
-
-**Why a sysadmin needs this:** Scripts that should be idempotent ("delete this if it exists, otherwise do nothing").
-
-> `-f` does **not** bypass directory permissions. It can remove read-only files only because `rm` deletes the **directory entry**, which needs write+execute on the **parent directory**.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Still `Permission denied` | You lack write on the parent — `sudo` or fix the parent's mode |
-
----
-
-### Task 12 — The infamous `rm -rf`
-
-**Purpose:** Most dangerous combination. Understand it deeply before ever typing it on production.
-
-```bash
-ls ~/rm-lab/configs
-rm -rf ~/rm-lab/configs
-ls ~/rm-lab
-```
-
-**Expected output:**
-
-```
-httpd.conf  nginx.conf  sshd.conf
-empty  logs
-```
-
-**Switches**
-
-| Flag combo | Meaning |
-|---|---|
-| `-r` | Recursive |
-| `-f` | Force — no prompts, ignore missing |
-| Together | Silently delete everything, even read-only files, no second chances |
-
-**Output decoded**
-
-| Phase | What happened |
-|---|---|
-| Before | `configs/` with three files |
-| After | All gone, no confirmation |
-
-### `rm -rf` Safety Checklist (memorize before pressing Enter)
-
-1. **`pwd` first** — confirm where you are.
-2. **`ls` the target** — confirm what you're about to delete.
-3. **Use absolute paths** — never `rm -rf $VAR/something` when `$VAR` might be empty.
-4. **Quote and brace variables** — `rm -rf "${VAR:?error}"/path` exits if `VAR` is unset/empty.
-5. **Prefer `mv` first** — `mv target /tmp/target.delete-me` then `rm -rf` later.
-6. **`echo` first** — `echo rm -rf $TARGET` shows exactly what will run.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| You realized too late | Check backups / snapshots immediately |
-
----
-
-### Task 13 — Variable-safety: `${VAR:?}` saves careers
-
-**Purpose:** Make `rm -rf` impossible to run with an unset variable.
-
-```bash
-TARGET=""
-rm -rf "${TARGET:?TARGET must be set}/some/path" 2>&1 || echo "Refused"
-
-TARGET="$HOME/rm-lab/safe-demo"
-mkdir -p "$TARGET"
-rm -rf "${TARGET:?TARGET must be set}"
-echo "exit code = $?"
-```
-
-**Expected output:**
-
-```
-bash: TARGET: TARGET must be set
-Refused
-exit code = 0
-```
-
-**Switches / shell tokens**
-
-| Token | Meaning |
-|---|---|
-| `${VAR:?msg}` | Bash exits the command with `msg` if VAR is unset/empty |
-| `${VAR:-default}` | Substitute default if VAR is unset/empty |
-| `--` (in `rm -rf -- "$VAR"`) | Treat everything after `--` as filenames, not flags |
-
-**Output decoded**
-
-| Phase | Meaning |
-|---|---|
-| First call | `TARGET` empty → bash refused before `rm` ran |
-| Second call | `TARGET` set → directory removed successfully |
-
-**Why a sysadmin needs this:** A misspelled `$TARGET` becoming empty is exactly how `rm -rf /` happens.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `TARGET` mistakenly set to `/` | Add `[[ "$TARGET" == "/" ]] && exit 1` as a guard |
-
----
-
-### Task 14 — `--one-file-system` for paranoid recursive deletes
-
-**Purpose:** Prevent `rm -rf` from crossing mount boundaries by accident.
-
-```bash
-mkdir -p ~/rm-lab/safety/inside
-touch ~/rm-lab/safety/inside/file_{1..3}.tmp
-rm -rfv --one-file-system ~/rm-lab/safety
-```
-
-**Expected output:**
-
-```
-removed '/home/ec2-user/rm-lab/safety/inside/file_1.tmp'
-removed '/home/ec2-user/rm-lab/safety/inside/file_2.tmp'
-removed '/home/ec2-user/rm-lab/safety/inside/file_3.tmp'
-removed directory '/home/ec2-user/rm-lab/safety/inside'
-removed directory '/home/ec2-user/rm-lab/safety'
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `--one-file-system` | Refuse to cross mount points during recursion |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| Each `removed` line | Stayed within the home filesystem |
-
-**Why a sysadmin needs this:** If `/some/tree` contains a mountpoint like `/mnt/data`, `--one-file-system` stops `rm` from wiping `/mnt/data`.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Skipped a subtree unexpectedly | That subtree was on another mount — fine, that's the safety working |
-
----
-
-### Task 15 — `--preserve-root` is the default; never disable it
-
-**Purpose:** Demonstrate the GNU `rm` safety net for `/`.
-
-```bash
-sudo rm -rf / 2>&1 | head -2
-```
-
-**Expected output:**
-
-```
-rm: it is dangerous to operate recursively on '/'
-rm: use --no-preserve-root to override this failsafe
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `--preserve-root` (default) | Refuses `rm -rf /` |
-| `--no-preserve-root` | **Removes the safety.** Don't. Ever. |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `dangerous to operate recursively on '/'` | Saved your career |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| You see `--no-preserve-root` in a script | Reject the change. There's no legitimate use case in normal sysadmin work. |
-
----
-
-### Task 16 — Awkward filenames: dash-prefix, spaces, special chars
-
-**Purpose:** Some filenames need defensive quoting or the `--` end-of-options.
-
-```bash
-cd ~/rm-lab
-touch -- "-file_with_dash.txt"
-touch "   spaces.txt"
-touch 'special_$char.txt'
-
-rm -- -file_with_dash.txt
-rm "   spaces.txt"
-rm 'special_$char.txt'
+mkdir -p /tmp/rm-lab && cd /tmp/rm-lab
+
+touch a.txt b.txt c.txt
+ls -l
+
+rm a.txt
+ls
+rm -v b.txt
+ls
+rm -i c.txt        # type 'y' to confirm
 ls
 ```
 
-**Expected output:**
+**Human-Readable Breakdown:** Create three empty files, remove them three ways: silent, verbose, interactive. See what each operator looks like.
 
-```
-empty  logs
-```
+**Reading it left to right:** Plain `rm` removes silently. `-v` prints the action. `-i` reads from stdin before removing. None of them recover anything.
 
-**Switches / patterns**
-
-| Pattern | Use case |
-|---|---|
-| `rm -- -file_with_dash.txt` | `--` tells `rm` "no more flags" — everything after is a name |
-| `rm ./-file_with_dash.txt` | Alternative — explicit relative path |
-| `rm "   spaces.txt"` | Double quotes preserve spaces |
-| `rm 'special_$char.txt'` | Single quotes prevent `$` expansion |
-
-**Output decoded**
-
-| Phase | Meaning |
-|---|---|
-| Each `rm` succeeded silently | Quoting solved the naming traps |
-
-**Universal escape hatch** — when you can't type the name, delete by inode:
-
-```bash
-ls -li
-find . -inum INODE -exec rm -i {} \;
-```
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `rm: invalid option -- 'f'` for `rm -file.txt` | Use `rm -- -file.txt` or `rm ./-file.txt` |
-
----
-
-### Task 17 — Bulk-by-criteria with `find -delete`
-
-**Purpose:** Delete files matching age/size/name — the right tool for log rotation.
-
-```bash
-mkdir -p ~/rm-lab/expiry
-touch -d "60 days ago" ~/rm-lab/expiry/old_{1..3}.log
-touch              ~/rm-lab/expiry/new_{1..3}.log
-
-find ~/rm-lab/expiry -type f -mtime +30 -print
-find ~/rm-lab/expiry -type f -mtime +30 -delete
-ls ~/rm-lab/expiry/
-```
+**The story:** Default `rm` is the muscle memory you build for known-safe paths. `rm -v` is the audit-friendly form for scripts. `rm -i` is for "did I really mean this?" moments.
 
 **Expected output:**
 
-```
-/home/ec2-user/rm-lab/expiry/old_1.log
-/home/ec2-user/rm-lab/expiry/old_2.log
-/home/ec2-user/rm-lab/expiry/old_3.log
-new_1.log  new_2.log  new_3.log
+```text
+-rw-r--r--. 1 user user 0 May 26 14:30 a.txt
+-rw-r--r--. 1 user user 0 May 26 14:30 b.txt
+-rw-r--r--. 1 user user 0 May 26 14:30 c.txt
+b.txt  c.txt
+removed 'b.txt'
+c.txt
+rm: remove regular empty file 'c.txt'? y
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `find PATH` | Start at PATH |
-| `-type f` | Regular files only |
-| `-mtime +30` | mtime > 30 days ago |
-| `-print` | Default action — list matches |
-| `-delete` | Built-in deletion |
-
-**Output decoded**
-
-| Phase | What happened |
-|---|---|
-| `-print` (dry run) | Lists files that **would** be deleted |
-| `-delete` (production run) | Same files actually deleted |
-| `ls` after | Only the recent files remain |
-
-> **Rule:** `-print` first, **then** swap to `-delete`. Never skip the dry run.
+| `rm FILE` | Silent removal |
+| `-v` | Verbose |
+| `-i` | Prompt before each removal |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `find: -delete: cannot delete` on non-empty dirs | Add `-depth` so `find` deletes contents before parent |
+| `rm: cannot remove 'X': Permission denied` | You need write on the **parent directory**, not the file |
+| `rm` did not free disk space | Process still holds it open; use `lsof FILE` and close |
+| `rm` removed only the symlink, not the target | Correct behavior — symlinks are independent inodes |
 
 ---
 
-### Task 18 — Safer alternative: quarantine with `mv`
+### Task 2 — `rmdir` vs `rm -r` for directories
 
-**Purpose:** When unsure, move to a trash dir instead of deleting.
+**Purpose:** Show that `rmdir` requires empty directories and `rm -r` is needed for non-empty trees.
 
 ```bash
-mkdir -p /tmp/trash-$(date +%F)
-echo "draft" > ~/rm-lab/maybe.txt
-mv -v ~/rm-lab/maybe.txt /tmp/trash-$(date +%F)/
-ls /tmp/trash-*/
+cd /tmp/rm-lab
+mkdir -p empty-dir nest/a/b/c
+touch nest/a/file1.txt nest/a/b/file2.txt
+
+rmdir empty-dir
+ls
+
+rmdir nest
+ls
+rmdir nest/a/b/c
+ls -R nest
+
+rm -r nest
+ls
 ```
+
+**Human-Readable Breakdown:** `rmdir empty-dir` succeeds. `rmdir nest` fails because nest is non-empty. `rmdir nest/a/b/c` succeeds because `c` is empty. Finally `rm -r nest` cleans the whole tree.
+
+**Reading it left to right:** `rmdir` calls `rmdir(2)`, which only works on empty directories. `rm -r DIR` recurses into DIR, unlinking files and rmdir'ing emptied subdirs depth-first.
+
+**The story:** Use `rmdir` when you know the directory is empty — it's a sanity check. Use `rm -r` only when you have audited the contents. Use `rm -rf` only when the contents do not matter at all.
 
 **Expected output:**
 
-```
-renamed '/home/ec2-user/rm-lab/maybe.txt' -> '/tmp/trash-2026-09-12/maybe.txt'
-maybe.txt
+```text
+nest
+rmdir: failed to remove 'nest': Directory not empty
+nest
+nest/a:
+b  file1.txt
+
+nest/a/b:
+file2.txt
+
+(empty)
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `mv -v` | Move with verbose audit (Lab 10) |
-| `$(date +%F)` | Today's date in `YYYY-MM-DD` |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| File now in `/tmp/trash-2026-09-12/` | Recoverable until the next reboot (or scheduled cleanup) |
-
-**Alternatives table**
-
-| Tool | Behavior | When to prefer |
-|---|---|---|
-| `mv target /tmp/trash-YYYYMMDD/` | Quarantine; delete later | When unsure |
-| `trash-put` (trash-cli) | Real recycle bin | Daily desktop use; not always on exam VMs |
-| `find ... -delete` | Predicate-driven | Targeted bulk |
-| `shred -u` | Overwrite then delete | Sensitive data on spinning disks (not SSD/COW) |
-| `: > file` | Truncate (don't delete) | Logs held open by a daemon |
+| `rmdir DIR` | Remove empty directory |
+| `rmdir -p A/B/C` | Remove A/B/C, then A/B, then A if empty |
+| `rm -r DIR` | Recursive — directories and contents |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Trash directory fills disk | Add a cron: `find /tmp/trash-* -mtime +7 -delete` |
+| `rmdir: 'X': Directory not empty` | Use `rm -r` or empty it first |
+| `rm: cannot remove 'X': Is a directory` | Add `-r` |
+| Directory came back after `rm -r` | Something else is recreating it (cron, service) |
 
 ---
 
-### Task 19 — RHCSA-style scenario
+### Task 3 — `rm -rf` carefully (with `pwd` discipline)
 
-**Task statement:** *"Remove the empty directory `/srv/old_empty`, then recursively delete `/srv/cache` if it exists, ignoring any 'does not exist' errors."*
-
-```bash
-sudo mkdir -p /srv/old_empty /srv/cache/{a,b,c}
-sudo touch /srv/cache/file.bin
-
-ls /srv
-
-sudo rmdir /srv/old_empty 2>/dev/null || sudo rm -d /srv/old_empty 2>/dev/null
-sudo rm -rfv /srv/cache
-
-ls /srv 2>/dev/null
-```
-
-**Expected output:**
-
-```
-cache  old_empty
-removed '/srv/cache/file.bin'
-removed directory '/srv/cache/a'
-removed directory '/srv/cache/b'
-removed directory '/srv/cache/c'
-removed directory '/srv/cache'
-(empty /srv)
-```
-
-**Step-by-step rationale**
-
-| Step | Why |
-|---|---|
-| `rmdir` first | Confirms `old_empty` is truly empty |
-| `\|\| rm -d` fallback | One-liner safety |
-| `rm -rfv /srv/cache` | Recursive, force (idempotent), verbose (audit) |
-| Final `ls` | Verification |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| Each `removed` line | Audit trail |
-| Empty `/srv` | Success |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `rmdir: failed: Directory not empty` | Forget `rmdir` — switch to `rm -rf` if you confirm contents are disposable |
-
----
-
-### Task 20 — CKA/Ansible-style scenario: idempotent removal
-
-**Task statement (CKA-flavored):** *"Ensure `/etc/kubernetes/manifests/kube-scheduler.yaml.bak` is removed if it exists. Operation must not fail on a fresh node."*
+**Purpose:** Use `rm -rf` to clear a tree, but practice the senior-engineer ritual `pwd; ls; quote variables` first.
 
 ```bash
-sudo mkdir -p /etc/kubernetes/manifests
-sudo touch /etc/kubernetes/manifests/kube-scheduler.yaml.bak
+cd /tmp/rm-lab
+mkdir -p big-tree/a/b/c big-tree/d/e
+for i in 1 2 3 4 5; do touch "big-tree/file$i"; done
 
-ls /etc/kubernetes/manifests/
-
-sudo rm -fv /etc/kubernetes/manifests/kube-scheduler.yaml.bak
-sudo rm -fv /etc/kubernetes/manifests/kube-scheduler.yaml.bak   # second run — must not fail
-
-echo "exit code on missing = $?"
-```
-
-**Expected output:**
-
-```
-kube-scheduler.yaml.bak
-removed '/etc/kubernetes/manifests/kube-scheduler.yaml.bak'
-exit code on missing = 0
-```
-
-**Step-by-step rationale**
-
-| Step | Why |
-|---|---|
-| `rm -fv` | Force = ignore missing; verbose = audit |
-| Second `rm -fv` (file already gone) | Returns exit code 0 — proves idempotency |
-
-**Equivalent Ansible (RHCE EX294)**
-
-```yaml
-- name: Remove old scheduler backup
-  ansible.builtin.file:
-    path: /etc/kubernetes/manifests/kube-scheduler.yaml.bak
-    state: absent
-```
-
-| Key | Mirrors `rm` |
-|---|---|
-| `state: absent` | `rm -rf` if a dir, `rm -f` if a file |
-| (no `force:` needed) | Idempotent by design |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| First `removed` | File deleted |
-| Empty (no second `removed`) | Already gone — `-f` quieted the failure |
-| `exit code = 0` | Script safe to re-run |
-
-**Final lab cleanup**
-
-```bash
-cd ~
+# Pre-delete inspection — DO THIS EVERY TIME
 pwd
-ls -la rm-lab
-rm -rfv rm-lab
-ls -la rm-lab 2>/dev/null
-sudo rm -rf /srv/old_empty /srv/cache /etc/kubernetes/manifests/kube-scheduler.yaml.bak
+ls big-tree
+du -sh big-tree
+
+# Quoted variable — safer than typing the path twice
+TARGET="/tmp/rm-lab/big-tree"
+echo "About to remove: $TARGET"
+test -d "$TARGET" && rm -rfv "$TARGET" | head -n 10
+echo "After: "
+ls /tmp/rm-lab/
+
+# Counter-example — what NOT to type:
+# rm -rf $TARGET/   ← unquoted: if TARGET is unset, becomes `rm -rf /`
+# rm -rf "$TARGET"/ ← quoted but with trailing slash; safer but still verify path first
+```
+
+**Human-Readable Breakdown:** Build a non-trivial tree, pre-inspect, store target in a quoted variable, guard with `test -d`, run `rm -rfv` to see each removal. The commented counter-example shows the unquoted-variable footgun.
+
+**Reading it left to right:** `pwd` confirms you're where you think you are. `ls` confirms the target exists and is what you expect. `test -d "$TARGET"` guards against missing path. `rm -rfv "$TARGET"` removes verbosely; output piped to `head` for sanity.
+
+**The story:** This is the canonical senior-engineer rm pattern. Three commands of friction prevent the worst incident of your career.
+
+**Expected output:**
+
+```text
+/tmp/rm-lab
+a  d  file1  file2  file3  file4  file5
+20K  big-tree
+About to remove: /tmp/rm-lab/big-tree
+removed 'big-tree/file1'
+removed 'big-tree/file2'
+removed 'big-tree/file3'
+...
+removed directory 'big-tree'
+After:
+```
+
+**Switches**
+
+| Token | Meaning |
+|---|---|
+| `rm -rf PATH` | Force recursive — no prompt, ignore missing |
+| `rm -rfv PATH` | Same, verbose |
+| `test -d "$VAR"` | Guard: only proceed if `$VAR` is a directory |
+| `du -sh DIR` | Summarized size (sanity check) |
+
+**Troubleshoot**
+
+| Symptom | Fix |
+|---|---|
+| Wrong directory removed | `pwd; ls` ritual catches this every time |
+| `rm -rf` silently did nothing | `-f` silences missing-path errors — use `-rv` to see |
+| `rm: cannot remove '/'` | `--preserve-root` blocks; never use `--no-preserve-root` |
+
+---
+
+### Task 4 — `-I` once-per-operation prompts and `-i` per-file prompts
+
+**Purpose:** Differentiate `-i` (every file) from `-I` (once at the start) and adopt `-I` as the safer interactive default.
+
+```bash
+cd /tmp/rm-lab
+mkdir -p batch
+touch batch/f{1..10}
+
+# -i prompts for EACH file
+rm -i batch/f{1..3}     # type y y y
+
+# -I prompts ONCE if >3 files OR recursive
+rm -Ir batch            # type y
+
+ls
+```
+
+**Human-Readable Breakdown:** Create a batch of files. `rm -i` produces 10 prompts; `rm -Ir` produces one. Use `-I` for any "are you sure?" question and `-i` only when you genuinely want per-file control.
+
+**Reading it left to right:** `-i` is interactive=always. `-I` is interactive=once when the operation removes >3 files or is recursive. Both read stdin.
+
+**The story:** Most engineers never use `-i` because the prompts are unbearable. `-I` gives you the safety with one keystroke of friction.
+
+**Expected output:**
+
+```text
+rm: remove regular empty file 'batch/f1'? y
+rm: remove regular empty file 'batch/f2'? y
+rm: remove regular empty file 'batch/f3'? y
+rm: remove 7 arguments recursively? y
+(empty)
+```
+
+**Switches**
+
+| Token | Meaning |
+|---|---|
+| `-i` | Prompt before every operation |
+| `-I` | Prompt once if >3 args or `-r` |
+
+**Troubleshoot**
+
+| Symptom | Fix |
+|---|---|
+| `-i` overwhelmed me | Use `-I` next time |
+| `-I` did not prompt | The operation was <4 files and not recursive — that's by design |
+
+---
+
+### Task 5 — Quarantine pattern and criteria-based cleanup
+
+**Purpose:** Use `mv → /tmp/trash` to "delete" reversibly, and `find -delete` to remove by criteria (age, size, name).
+
+```bash
+mkdir -p /tmp/rm-lab/trash
+cd /tmp/rm-lab
+
+touch maybe-delete.txt
+ls maybe-delete.txt
+mv maybe-delete.txt /tmp/rm-lab/trash/
+ls maybe-delete.txt 2>&1 | head -n 1
+ls /tmp/rm-lab/trash/
+
+# Empty the trash later
+rm -rf /tmp/rm-lab/trash/*
+ls /tmp/rm-lab/trash/
+
+# Criteria-based deletion with find
+mkdir -p age
+touch -d "40 days ago" age/old1 age/old2 age/old3
+touch age/new1 age/new2
+ls -lt age/
+
+find age -type f -mtime +30
+find age -type f -mtime +30 -delete
+ls age/
+```
+
+**Human-Readable Breakdown:** "Delete" `maybe-delete.txt` by moving it to the trash directory — fully reversible until you empty the trash. Then create five files with mixed ages and use `find -delete` to remove only those older than 30 days.
+
+**Reading it left to right:** `mv FILE /tmp/rm-lab/trash/` relocates instead of unlinks. Later `rm -rf` empties the trash for real. `find -type f -mtime +30 -delete` lists files matching the predicate and unlinks each; without `-delete` it just prints (the safe preview mode).
+
+**The story:** Quarantine before delete is how senior engineers run a `cleanup.sh` script the first time on a new system. Once the script has been audited and the trash directory has been monitored for a week, you can switch to direct `rm` confidently.
+
+**Expected output:**
+
+```text
+-rw-r--r--. 1 user user 0 May 26 14:35 maybe-delete.txt
+ls: cannot access 'maybe-delete.txt': No such file or directory
+maybe-delete.txt
+(empty)
+-rw-r--r--. 1 user user 0 ... new2
+-rw-r--r--. 1 user user 0 ... new1
+-rw-r--r--. 1 user user 0 2026-04-16 ... old3
+-rw-r--r--. 1 user user 0 2026-04-16 ... old2
+-rw-r--r--. 1 user user 0 2026-04-16 ... old1
+age/old1
+age/old2
+age/old3
+new1  new2
+```
+
+**Switches**
+
+| Token | Meaning |
+|---|---|
+| `mv FILE /tmp/trash/` | Quarantine instead of unlink |
+| `find PATH -mtime +N` | Files older than N*24h |
+| `find ... -delete` | Unlink each matching file |
+| `find ... -print -delete` | Print before deleting |
+
+**Troubleshoot**
+
+| Symptom | Fix |
+|---|---|
+| `find -delete` removed too much | Run without `-delete` first to preview |
+| `find -delete` did not remove dirs | Add `-depth` to delete contents-before-parent |
+| Quarantine dir is filling up | Set up a cron `find /tmp/trash -mtime +7 -delete` |
+
+---
+
+### Task 6 — Capstone: RHCSA-realistic age-based cleanup
+
+**Task statement:** *"Clean out `/root/cleanup/` of every file older than 30 days and every empty subdirectory. Leave files newer than 30 days intact. Report the count of files removed and the count of survivors. Save both counts to `/root/cleanup-report.txt`."*
+
+**Purpose:** Execute a complete cleanup with audit trail.
+
+```bash
+sudo -i
+
+# Build a controlled fixture
+rm -rf /root/cleanup
+mkdir -p /root/cleanup/{recent,old,mixed,empty}
+touch -d "40 days ago" /root/cleanup/old/{file1,file2,file3}
+touch -d "40 days ago" /root/cleanup/mixed/oldA
+touch                  /root/cleanup/mixed/newA
+touch                  /root/cleanup/recent/{r1,r2,r3}
+
+echo "Before cleanup:"
+find /root/cleanup -type f | wc -l
+
+# Stage 1 — remove old files
+REMOVED=$(find /root/cleanup -type f -mtime +30 -print -delete | wc -l)
+
+# Stage 2 — remove now-empty subdirectories (depth-first)
+find /root/cleanup -mindepth 1 -type d -empty -delete
+
+echo "After cleanup:"
+SURVIVORS=$(find /root/cleanup -type f | wc -l)
+find /root/cleanup -type f
+
+{
+  echo "Cleanup report  $(date -Is)"
+  echo "  removed: $REMOVED"
+  echo "  survivors: $SURVIVORS"
+} | tee /root/cleanup-report.txt
+
+test -s /root/cleanup-report.txt && echo "VERIFY: report exists and is non-empty"
+```
+
+**Human-Readable Breakdown:** Become root, build a fixture with three age groups, two-stage cleanup: (1) `find -mtime +30 -delete` removes old files and counts them, (2) `find -empty -delete` removes any subdirectories that the first stage emptied. Tally survivors. Write everything to `/root/cleanup-report.txt`.
+
+**Layer stack you built:**
+
+```text
+/root/cleanup/
+   ├── recent/ (3 new files — kept)
+   ├── old/    (3 old files — removed → dir now empty → removed)
+   ├── mixed/  (1 old + 1 new → old removed, new kept)
+   └── empty/  (already empty → removed)
+
+After cleanup:
+/root/cleanup/recent/r1
+/root/cleanup/recent/r2
+/root/cleanup/recent/r3
+/root/cleanup/mixed/newA
+```
+
+**The story:** This is the **canonical scheduled-cleanup pattern.** Memorize the spine: `find PATH -type f -mtime +N -delete` then `find PATH -mindepth 1 -type d -empty -delete`. Two stages, no surprises.
+
+**Expected verification output:**
+
+```text
+Before cleanup:
+8
+After cleanup:
+4
+/root/cleanup/recent/r3
+/root/cleanup/recent/r2
+/root/cleanup/recent/r1
+/root/cleanup/mixed/newA
+Cleanup report  2026-05-26T14:40:00-04:00
+  removed: 4
+  survivors: 4
+VERIFY: report exists and is non-empty
+```
+
+**Cleanup**
+
+```bash
+rm -rf /tmp/rm-lab /root/cleanup /root/cleanup-report.txt
+exit
 ```
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `rm: refusing to remove` on `/` ancestors | You typed an ancestor by mistake — abort and review |
+| Removed too many files | Verify with `find -mtime +30 -print` (no -delete) first |
+| Empty directories remain | `-mindepth 1` includes them only if they had no contents at scan time |
+| `Permission denied` writing report | Not root — `sudo -i` |
+| Counts disagree across runs | The clock moved — re-touch fixtures with `-d` |
 
 ---
 
 ## 🔍 Deletion Decision Guide
 
 ```
-Empty directory?
-  ├── Yes → rmdir <dir>          (refuses non-empty)
-  ├── Yes, plus empty parents → rmdir -p <dir>
-  └── In a one-shot script → rm -d <dir>
-
-Single file?
-  ├── Confident → rm <file>
-  └── Unsure    → rm -i <file>
-
-Directory + contents?
-  ├── Confident → rm -rv <dir>
-  ├── Unsure    → rm -ri <dir>   (every prompt) OR rm -Ir <dir>  (one prompt)
-  └── Idempotent (no fail if missing) → rm -rf <dir>
-
-Bulk by criteria (age/size/name)?
-  ├── find <path> ... -print           (dry run first)
-  └── find <path> ... -delete          (only after dry run is correct)
-
-Cross-mount safety needed?
-  └── rm -rf --one-file-system <dir>
-
-Filename starts with - or has odd chars?
-  └── rm -- <name>   or   rm ./<name>
-
-Want a safety net?
-  └── mv target /tmp/trash-$(date +%F)/   (then real rm later)
+Need to delete something?
+  │
+  ├── "One file"
+  │       └── ✅ rm FILE
+  │
+  ├── "One empty directory"
+  │       └── ✅ rmdir DIR
+  │
+  ├── "Whole directory tree"
+  │       └── ✅ rm -r DIR             (safer when interactive)
+  │       └── ✅ rm -rf DIR            (force; for scripts)
+  │       └── ✅ rm -Ir DIR            (prompt once; safer interactive default)
+  │
+  ├── "By criteria — age, size, owner"
+  │       └── ✅ find PATH -PRED -delete
+  │
+  ├── "First time on a new system — undo-friendly"
+  │       └── ✅ mv FILE /tmp/trash/         (then rm -rf the trash later)
+  │
+  ├── "Sensitive data on a spinning disk"
+  │       └── ✅ shred -u FILE
+  │
+  ├── "Empty a log file held open by a daemon"
+  │       └── ✅ : > /var/log/app.log         (do NOT rm — daemon's FD is fine)
+  │
+  ├── "Refuse to cross mount boundaries"
+  │       └── ✅ rm -rf --one-file-system DIR
+  │
+  └── "Filename starts with -"
+          └── ✅ rm -- -filename            (or rm ./-filename)
 ```
 
 ---
 
-## ✅ Lab Checklist (20 Tasks)
+## ✅ Lab Checklist (6 Tasks)
 
-- [ ] 01 Set up `~/rm-lab` with mixed empty/populated dirs
-- [ ] 02 Delete a single file with `rm`
-- [ ] 03 Confirm `rm` refuses directories without `-r` or `-d`
-- [ ] 04 Delete an empty directory with `rmdir`
-- [ ] 05 Delete an empty parent chain with `rmdir -p`
-- [ ] 06 Delete an empty directory with `rm -d`
-- [ ] 07 Delete a populated tree with `rm -r`
-- [ ] 08 Prompt-per-file with `rm -ri`
-- [ ] 09 Single prompt with `rm -Ir`
-- [ ] 10 Verbose audit with `rm -rv`
-- [ ] 11 Idempotent `rm -f` (no fail on missing)
-- [ ] 12 Use `rm -rf` (in your own lab dir only)
-- [ ] 13 Harden scripts with `${VAR:?must be set}`
-- [ ] 14 `--one-file-system` for cross-mount safety
-- [ ] 15 Confirm `--preserve-root` is the default
-- [ ] 16 Delete files with awkward names (`-name`, spaces, special chars)
-- [ ] 17 Bulk delete with `find -delete` (dry run first)
-- [ ] 18 Safer alternative: quarantine with `mv`
-- [ ] 19 Exam: `rmdir` + `rm -rf` combo
-- [ ] 20 CKA/Ansible: idempotent `rm -f` and `state: absent`
+- [ ] 01 Set up `/tmp/rm-lab` and remove files with `rm`, `rm -v`, `rm -i`
+- [ ] 02 Distinguish `rmdir` (empty only) from `rm -r` (everything)
+- [ ] 03 Practice the `pwd; ls; quoted variable; test -d` ritual before `rm -rf`
+- [ ] 04 Use `-I` for once-per-operation prompts; understand `-i` per-file prompts
+- [ ] 05 Quarantine with `mv → /tmp/trash`; criteria-delete with `find -delete`
+- [ ] 06 Execute the RHCSA capstone — age-based two-stage cleanup of `/root/cleanup/`
 
 ---
 
@@ -1040,38 +616,35 @@ Want a safety net?
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| `rm -rf $VAR/*` with `$VAR` empty | Wipes current dir or root | Use `${VAR:?must be set}` and absolute paths |
-| `rm -rf .*` to remove dotfiles | Glob matches `..` → tries to ascend | Use `find . -maxdepth 1 -name '.*' -not -name '.' -not -name '..' -exec rm -rf {} +` |
-| Forgetting `rm` deletes symlinks, not targets | "I lost the file" — actually just the link | `ls -l link` before removing |
-| `rm -rf` on production after a typo | Catastrophic loss | Quarantine pattern: `mv` to `/tmp/trash/` first |
-| Relying on `alias rm='rm -i'` | Alias missing on fresh shell | Always type `-i` / `-I` explicitly |
-| Filename starting with `-` | `rm` interprets as flag | `rm -- -file` or `rm ./-file` |
-| `shred` on SSD/COW filesystem | Doesn't actually overwrite all copies | Use FDE (`cryptsetup`); `shred` only on spinning disks |
-| Forgetting graders' working directory | Deleted wrong thing | Always `pwd && ls` right before destructive commands |
+| Unquoted variable in `rm -rf` | Expansion to `/` or to other paths | Always quote `"$VAR"` |
+| Trailing space in `rm -rf $VAR /something` | Tries to remove two paths | Re-read carefully |
+| Confused `rm -r` and `rmdir` | Either "directory not empty" or "is a directory" | Pick the right tool |
+| `rm` did not free disk | Open FD pinning the inode | `lsof FILE` and close, or restart daemon |
+| Deleted symlink expecting target gone | Only the link removed | Use `readlink -f` first if you want target |
+| `find -delete` skipped subdirs | Need `-depth` for inside-out traversal | `find ... -depth -delete` |
+| `rm` of file with leading `-` | Treated as flag | `rm -- -file` or `rm ./-file` |
+| Removed a file across mount boundary you did not realize | Surprise | Use `--one-file-system` |
+| Cleaned `/tmp/trash` too aggressively | Lost quarantine value | Keep trash at least a week |
+| Trusted `rm -f` to "make sure" | Suppresses real errors | Read errors at least once before silencing |
 
 ---
 
-## 📌 Exam Strategy
+## 🎯 Career & Interview Strategy
 
-**RHCSA EX200**
-- "Remove file X" → `rm` (plain).
-- "Remove directory X":
-  - Empty → `rmdir X`
-  - Not empty → `rm -r X` (add `-f` if task says "force" or "ignore missing")
-- Always `ls -la <target>` immediately before any `rm -rf` — cheapest insurance.
+**RHCSA candidate**
+- Always end a task with cleanup if the prompt asks for it. Always `pwd; ls` before any `rm -rf`.
 
-**RHCE EX294 (Ansible)**
-- `ansible.builtin.file: state: absent` = idempotent `rm -rf`.
-- Works on files and directories alike (no separate flag).
+**RHCE candidate**
+- Ansible `file: state=absent  path: /target` is idempotent `rm -rf`. Use `force: yes` to override `_recursive` safety.
 
-**CKA**
-- `kubectl delete -f manifest.yaml` is the K8s-aware equivalent (handles finalizers).
-- On nodes: `rm` of `/etc/kubernetes/manifests/<file>.yaml` stops a static pod; reverse with `mv` from backup.
-- Avoid `rm -rf` on `/var/lib/etcd`, `/var/lib/containerd`, `/etc/kubernetes/pki` without snapshots.
+**SRE / Platform interview**
+- "How would you safely clean up old log files?" → "Two-stage `find`: `find /var/log -type f -mtime +30 -delete` then `find /var/log -mindepth 1 -type d -empty -delete`. Audit `-print` before `-delete`."
 
-**RHCA**
-- RH342: quarantine pattern, `find -delete` for log forensics.
-- RH358: stop service before `rm` of runtime state directories.
+**DevOps**
+- CI cache eviction: per-job `find $CACHE -atime +7 -delete`.
+
+**AI / MLOps**
+- Old checkpoints: keep last N, delete the rest. `ls -t ckpt-*.pt | tail -n +6 | xargs -r rm -v`.
 
 ---
 
@@ -1079,17 +652,15 @@ Want a safety net?
 
 | Lab | Connection |
 |---|---|
-| Lab 05 — Navigation | `pwd` before `rm -rf` is non-negotiable |
-| Lab 06 — `ls -l` | Verify what's there before deletion |
-| Lab 08 — `cp --backup` | Safety net `rm` lacks |
-| Lab 09 — Links | `rm` removes a symlink; target is untouched |
-| Lab 10 — `mv` | Quarantine pattern (`mv` to `/tmp/trash/` then `rm`) |
-| Task 8 — Create dirs | Symmetrical cleanup with `rmdir`/`rm -r` |
-| Task 13/14 — cron + find | `find -delete` for scheduled cleanups |
+| Lab 05 — Directory Navigation | The `pwd; ls` discipline starts here |
+| Lab 08 — Copying Files | `cp -a` to staging before `rm` is the safe-deploy pattern |
+| Lab 09 — Hard and Soft Links | Why `rm` of one of N hard links doesn't free data |
+| Lab 14 — File Searching with `find` | `-delete` predicate for criteria-based cleanup |
+| Lab — Cron Cleanup of /var/tmp *(later)* | Production schedule of these patterns |
 
 ---
 
 ## 👤 Author
 
-**Kelvin R. Tobias**  
+**Kelvin R. Tobias**
 [kelvinintech.com](https://kelvinintech.com) · [GitHub](https://github.com/kelvintechnical) · [LinkedIn](https://www.linkedin.com/in/kelvin-r-tobias-211949219)
